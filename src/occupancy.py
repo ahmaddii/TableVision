@@ -1,6 +1,8 @@
 import cv2
 import json
+import os
 import sys
+import time
 import numpy as np
 import torch
 
@@ -10,7 +12,8 @@ from ultralytics import YOLO
 
 # ---------------- CONFIGURATION ----------------
 
-ZONES_PATH = "outputs/table_zones.json"
+ZONES_PATH = "outputs/table_zones_1.json"
+OUTPUT_PATH = "outputs/restaurant_occupancy.mp4"
 
 # Pose model separates seated guests from standing people much better.
 # Set USE_POSE = False and MODEL_PATH = "yolo26s.pt" for a plain detector.
@@ -239,6 +242,23 @@ def main():
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    output_path = OUTPUT_PATH
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    video_writer = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        fps,
+        (width, height)
+    )
+    if not video_writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open output video for writing: {output_path}")
 
     scale_x = width / zone_data["frame_width"]
     scale_y = height / zone_data["frame_height"]
@@ -291,417 +311,442 @@ def main():
         return any(track_id in confirmed[t] for t in tables)
 
     frame_number = 0
+    processing_started = time.perf_counter()
 
     print("Restaurant occupancy detection started.")
     print(f"Tables loaded: {len(tables)}")
-    print("Press Q to quit.")
-
-    while True:
-
-        # Skip frames cheaply (grab = decode only, no processing)
-        for _ in range(max(1, DETECT_EVERY_N) - 1):
-            cap.grab()
-
-        success, frame = cap.read()
-
-        if not success:
-            print("Video finished.")
-            break
-
-        frame_number += 1
-
-        results = model.track(
-            frame,
-            persist=True,
-            tracker=TRACKER,
-            classes=[0],
-            conf=CONFIDENCE,
-            imgsz=IMG_SIZE,
-            device=DEVICE,
-            half=HALF,
-            verbose=False
-        )
-
-        result = results[0]
-
-        # table -> {track_id: is_seated_candidate}
-        zone_people = {t: {} for t in tables}
-
-        # (box, track_id, label, color) drawn after blending
-        detections = []
-
-        if (
-            result.boxes is not None
-            and len(result.boxes) > 0
-            and result.boxes.id is not None
-        ):
-
-            boxes = result.boxes.xyxy.cpu().numpy()
-            track_ids = result.boxes.id.int().cpu().tolist()
-
-            keypoints = None
-
-            if USE_POSE and result.keypoints is not None:
-                keypoints = result.keypoints.data.cpu().numpy()
-
-            for i, (box, track_id) in enumerate(zip(boxes, track_ids)):
-
-                x1, y1, x2, y2 = map(int, box)
-
-                box_w = max(1, x2 - x1)
-                box_h = max(1, y2 - y1)
-
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-
-                # Fake people (posters, menu boards): drop completely
-                if ignore_contours and (
-                    in_any_zone((cx, cy), ignore_contours)
-                    or in_any_zone((cx, y2), ignore_contours)
-                ):
-                    continue
-
-                if track_id in ghost_ids:
-                    continue
-
-                track_last_seen[track_id] = frame_number
-                track_history[track_id].append((cx, cy, box_h))
-                track_pos[track_id] = (cx, cy, box_h)
-
-                # Staff zone (counter / kitchen door)
-                if staff_contours and in_any_zone((cx, cy), staff_contours):
-                    staff_ids.add(track_id)
-
-                stationary = is_stationary(
-                    track_history[track_id],
-                    min_history
-                )
-
-                pose_state = None   # True seated, False standing, None unknown
-
-                if keypoints is not None and i < len(keypoints):
-                    pose_state = pose_seated(keypoints[i])
-
-                posture = pose_state
-
-                if posture is None:
-                    posture = (box_h / box_w) <= MAX_SEATED_ASPECT
-
-                table_id = assign_table((cx, cy), tables)
-
-                # Ghost filter: never moves and never near a table = fake
-                if table_id is not None:
-                    track_near_table.add(track_id)
-
-                ox, oy, first_frame = track_origin.setdefault(
-                    track_id, (cx, cy, frame_number)
-                )
-
-                track_max_disp[track_id] = max(
-                    track_max_disp.get(track_id, 0.0),
-                    float(np.hypot(cx - ox, cy - oy))
-                )
-
-                if (
-                    ghost_frames > 0
-                    and frame_number - first_frame >= ghost_frames
-                    and track_id not in track_near_table
-                    and track_max_disp[track_id] <= 0.15 * box_h
-                ):
-                    ghost_ids.add(track_id)
-
-                if track_id in ghost_ids:
-                    continue
-
-                # Waiter rule: stopping at 2+ tables without being a guest
-                if table_id is not None and stationary:
-
-                    track_tables[track_id].add(table_id)
-
-                    if (
-                        len(track_tables[track_id]) >= STAFF_VISIT_LIMIT
-                        and not is_confirmed_anywhere(track_id)
-                    ):
-                        staff_ids.add(track_id)
-
-                label = None
-                color = (255, 255, 0)
-
-                if track_id in staff_ids:
-
-                    label = "STAFF (ignored)"
-                    color = (255, 0, 255)
-
-                elif table_id is not None:
-
-                    candidate = bool(posture and stationary)
-
-                    zone_people[table_id][track_id] = candidate
-
-                    if candidate:
-                        label = "SEATED"
-                        color = (0, 255, 255)
-                    else:
-                        label = "NEAR TABLE"
-
-                    if DEBUG_LABELS:
-                        pose_txt = {True: "S", False: "T", None: "?"}[pose_state]
-                        label += (
-                            f" p:{pose_txt} "
-                            f"{'still' if stationary else 'moving'}"
-                        )
-
-                detections.append(
-                    ((x1, y1, x2, y2), track_id, label, color)
-                )
-
-        # ---------- update table states ----------
-
-        occupied_count = 0
-        table_info = {}
-
-        for table_id in tables:
-
-            people = zone_people[table_id]
-
-            # Seat timers (strict: seated AND stationary)
-            for track_id, is_candidate in people.items():
-
-                if is_candidate:
-
-                    key = (table_id, track_id)
-
-                    if key not in seat_since:
-                        seat_since[key] = frame_number
-
-                    seat_last[key] = frame_number
-
-            for key in [k for k in seat_since if k[0] == table_id]:
-
-                if frame_number - seat_last[key] > gap_frames:
-                    del seat_since[key]
-                    del seat_last[key]
-                    continue
-
-                if (
-                    seat_last[key] == frame_number
-                    and frame_number - seat_since[key] >= confirm_frames
-                ):
-                    confirmed[table_id][key[1]] = {
-                        "last": frame_number,
-                        "pos": track_pos[key[1]],
-                    }
-
-            # ID handoff: ByteTrack sometimes gives a seated guest a new ID
-            # (e.g. after being hidden by a passing waiter). A seated, still
-            # person who appears right where a confirmed guest was just lost
-            # inherits that guest's status immediately.
-            for track_id, is_candidate in people.items():
-
-                if not is_candidate or track_id in confirmed[table_id]:
-                    continue
-
-                px, py, _ = track_pos[track_id]
-
-                best_old = None
-                best_dist = float("inf")
-
-                for old_id, info in confirmed[table_id].items():
-
-                    if old_id in people:
-                        continue
-
-                    if frame_number - info["last"] > handoff_frames:
-                        continue
-
-                    ox, oy, oh = info["pos"]
-
-                    dist = float(np.hypot(px - ox, py - oy))
-
-                    if dist <= HANDOFF_DIST_RATIO * oh and dist < best_dist:
-                        best_dist = dist
-                        best_old = old_id
-
-                if best_old is not None:
-
-                    del confirmed[table_id][best_old]
-
-                    confirmed[table_id][track_id] = {
-                        "last": frame_number,
-                        "pos": track_pos[track_id],
-                    }
-
-            # Confirmed guests stay alive while they remain in the zone
-            for track_id in people:
-
-                if track_id in confirmed[table_id]:
-                    confirmed[table_id][track_id]["last"] = frame_number
-                    confirmed[table_id][track_id]["pos"] = track_pos[track_id]
-
-            # Expire guests who left
-            for track_id, info in list(confirmed[table_id].items()):
-
-                if frame_number - info["last"] > exit_frames:
-                    del confirmed[table_id][track_id]
-
-            occupied = len(confirmed[table_id]) > 0
-
-            if occupied_state[table_id] and not occupied:
-
-                for key in [k for k in seat_since if k[0] == table_id]:
-                    del seat_since[key]
-                    del seat_last[key]
-
-            occupied_state[table_id] = occupied
-
-            # Only confirmed guests are ever counted - waiters never are
-            visible = [
-                track_id for track_id in people
-                if track_id in confirmed[table_id]
-            ]
-
-            count_history[table_id].append(len(visible))
-
-            if occupied:
-                people_count = int(round(
-                    float(np.median(count_history[table_id]))
-                ))
-                people_count = max(1, people_count)
-                occupied_count += 1
-            else:
-                people_count = 0
-
-            table_info[table_id] = (occupied, people_count)
-
-        # Prune old tracks
-        if frame_number % 100 == 0:
-
-            stale = [
-                tid for tid, seen in track_last_seen.items()
-                if frame_number - seen > eff_fps * 5
-            ]
-
-            for tid in stale:
-                track_history.pop(tid, None)
-                track_last_seen.pop(tid, None)
-                track_pos.pop(tid, None)
-                track_origin.pop(tid, None)
-                track_max_disp.pop(tid, None)
-
-        # ---------- drawing ----------
-
-        overlay = frame.copy()
-
-        for table_id, table in tables.items():
-
-            occupied, _ = table_info[table_id]
-            color = (0, 0, 255) if occupied else (0, 255, 0)
-
-            cv2.fillPoly(overlay, [table["draw"]], color)
-
-        frame = cv2.addWeighted(overlay, 0.18, frame, 0.82, 0)
-
-        for contour in staff_contours:
-            cv2.polylines(
-                frame,
-                [contour.astype(np.int32)],
-                True,
-                (255, 0, 255),
-                1
+    print(f"Output: {output_path}")
+
+    try:
+        while True:
+
+            # Skip frames cheaply (grab = decode only, no processing)
+            for _ in range(max(1, DETECT_EVERY_N) - 1):
+                if not cap.grab():
+                    break
+
+            success, frame = cap.read()
+
+            if not success or frame is None:
+                print("Input video ended or a frame could not be decoded.")
+                break
+
+            frame_number += 1
+
+            results = model.track(
+                source=frame,
+                persist=True,
+                tracker=TRACKER,
+                classes=[0],
+                conf=CONFIDENCE,
+                imgsz=IMG_SIZE,
+                device=DEVICE,
+                verbose=False
             )
 
-        if DEBUG_LABELS:
-            for contour in ignore_contours:
+            result = results[0]
+
+            # table -> {track_id: is_seated_candidate}
+            zone_people = {t: {} for t in tables}
+
+            # (box, track_id, label, color) drawn after blending
+            detections = []
+
+            if (
+                result.boxes is not None
+                and len(result.boxes) > 0
+                and result.boxes.id is not None
+            ):
+
+                boxes = result.boxes.xyxy.cpu().numpy()
+                track_ids = result.boxes.id.int().cpu().tolist()
+
+                keypoints = None
+
+                if USE_POSE and result.keypoints is not None:
+                    keypoints = result.keypoints.data.cpu().numpy()
+
+                for i, (box, track_id) in enumerate(zip(boxes, track_ids)):
+
+                    x1, y1, x2, y2 = map(int, box)
+
+                    box_w = max(1, x2 - x1)
+                    box_h = max(1, y2 - y1)
+
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+
+                    # Fake people (posters, menu boards): drop completely
+                    if ignore_contours and (
+                        in_any_zone((cx, cy), ignore_contours)
+                        or in_any_zone((cx, y2), ignore_contours)
+                    ):
+                        continue
+
+                    if track_id in ghost_ids:
+                        continue
+
+                    track_last_seen[track_id] = frame_number
+                    track_history[track_id].append((cx, cy, box_h))
+                    track_pos[track_id] = (cx, cy, box_h)
+
+                    # Staff zone (counter / kitchen door)
+                    if staff_contours and in_any_zone((cx, cy), staff_contours):
+                        staff_ids.add(track_id)
+
+                    stationary = is_stationary(
+                        track_history[track_id],
+                        min_history
+                    )
+
+                    pose_state = None   # True seated, False standing, None unknown
+
+                    if keypoints is not None and i < len(keypoints):
+                        pose_state = pose_seated(keypoints[i])
+
+                    posture = pose_state
+
+                    if posture is None:
+                        posture = (box_h / box_w) <= MAX_SEATED_ASPECT
+
+                    table_id = assign_table((cx, cy), tables)
+
+                    # Ghost filter: never moves and never near a table = fake
+                    if table_id is not None:
+                        track_near_table.add(track_id)
+
+                    ox, oy, first_frame = track_origin.setdefault(
+                        track_id, (cx, cy, frame_number)
+                    )
+
+                    track_max_disp[track_id] = max(
+                        track_max_disp.get(track_id, 0.0),
+                        float(np.hypot(cx - ox, cy - oy))
+                    )
+
+                    if (
+                        ghost_frames > 0
+                        and frame_number - first_frame >= ghost_frames
+                        and track_id not in track_near_table
+                        and track_max_disp[track_id] <= 0.15 * box_h
+                    ):
+                        ghost_ids.add(track_id)
+
+                    if track_id in ghost_ids:
+                        continue
+
+                    # Waiter rule: stopping at 2+ tables without being a guest
+                    if table_id is not None and stationary:
+
+                        track_tables[track_id].add(table_id)
+
+                        if (
+                            len(track_tables[track_id]) >= STAFF_VISIT_LIMIT
+                            and not is_confirmed_anywhere(track_id)
+                        ):
+                            staff_ids.add(track_id)
+
+                    label = None
+                    color = (255, 255, 0)
+
+                    if track_id in staff_ids:
+
+                        label = "STAFF (ignored)"
+                        color = (255, 0, 255)
+
+                    elif table_id is not None:
+
+                        candidate = bool(posture and stationary)
+
+                        zone_people[table_id][track_id] = candidate
+
+                        if candidate:
+                            label = "SEATED"
+                            color = (0, 255, 255)
+                        else:
+                            label = "NEAR TABLE"
+
+                        if DEBUG_LABELS:
+                            pose_txt = {True: "S", False: "T", None: "?"}[pose_state]
+                            label += (
+                                f" p:{pose_txt} "
+                                f"{'still' if stationary else 'moving'}"
+                            )
+
+                    detections.append(
+                        ((x1, y1, x2, y2), track_id, label, color)
+                    )
+
+            # ---------- update table states ----------
+
+            occupied_count = 0
+            table_info = {}
+
+            for table_id in tables:
+
+                people = zone_people[table_id]
+
+                # Seat timers (strict: seated AND stationary)
+                for track_id, is_candidate in people.items():
+
+                    if is_candidate:
+
+                        key = (table_id, track_id)
+
+                        if key not in seat_since:
+                            seat_since[key] = frame_number
+
+                        seat_last[key] = frame_number
+
+                for key in [k for k in seat_since if k[0] == table_id]:
+
+                    if frame_number - seat_last[key] > gap_frames:
+                        del seat_since[key]
+                        del seat_last[key]
+                        continue
+
+                    if (
+                        seat_last[key] == frame_number
+                        and frame_number - seat_since[key] >= confirm_frames
+                    ):
+                        confirmed[table_id][key[1]] = {
+                            "last": frame_number,
+                            "pos": track_pos[key[1]],
+                        }
+
+                # ID handoff: ByteTrack sometimes gives a seated guest a new ID
+                # (e.g. after being hidden by a passing waiter). A seated, still
+                # person who appears right where a confirmed guest was just lost
+                # inherits that guest's status immediately.
+                for track_id, is_candidate in people.items():
+
+                    if not is_candidate or track_id in confirmed[table_id]:
+                        continue
+
+                    px, py, _ = track_pos[track_id]
+
+                    best_old = None
+                    best_dist = float("inf")
+
+                    for old_id, info in confirmed[table_id].items():
+
+                        if old_id in people:
+                            continue
+
+                        if frame_number - info["last"] > handoff_frames:
+                            continue
+
+                        ox, oy, oh = info["pos"]
+
+                        dist = float(np.hypot(px - ox, py - oy))
+
+                        if dist <= HANDOFF_DIST_RATIO * oh and dist < best_dist:
+                            best_dist = dist
+                            best_old = old_id
+
+                    if best_old is not None:
+
+                        del confirmed[table_id][best_old]
+
+                        confirmed[table_id][track_id] = {
+                            "last": frame_number,
+                            "pos": track_pos[track_id],
+                        }
+
+                # Confirmed guests stay alive while they remain in the zone
+                for track_id in people:
+
+                    if track_id in confirmed[table_id]:
+                        confirmed[table_id][track_id]["last"] = frame_number
+                        confirmed[table_id][track_id]["pos"] = track_pos[track_id]
+
+                # Expire guests who left
+                for track_id, info in list(confirmed[table_id].items()):
+
+                    if frame_number - info["last"] > exit_frames:
+                        del confirmed[table_id][track_id]
+
+                occupied = len(confirmed[table_id]) > 0
+
+                if occupied_state[table_id] and not occupied:
+
+                    for key in [k for k in seat_since if k[0] == table_id]:
+                        del seat_since[key]
+                        del seat_last[key]
+
+                occupied_state[table_id] = occupied
+
+                # Only confirmed guests are ever counted - waiters never are
+                visible = [
+                    track_id for track_id in people
+                    if track_id in confirmed[table_id]
+                ]
+
+                count_history[table_id].append(len(visible))
+
+                if occupied:
+                    people_count = int(round(
+                        float(np.median(count_history[table_id]))
+                    ))
+                    people_count = max(1, people_count)
+                    occupied_count += 1
+                else:
+                    people_count = 0
+
+                table_info[table_id] = (occupied, people_count)
+
+            # Prune old tracks
+            if frame_number % 100 == 0:
+
+                stale = [
+                    tid for tid, seen in track_last_seen.items()
+                    if frame_number - seen > eff_fps * 5
+                ]
+
+                for tid in stale:
+                    track_history.pop(tid, None)
+                    track_last_seen.pop(tid, None)
+                    track_pos.pop(tid, None)
+                    track_origin.pop(tid, None)
+                    track_max_disp.pop(tid, None)
+
+            # ---------- drawing ----------
+
+            overlay = frame.copy()
+
+            for table_id, table in tables.items():
+
+                occupied, _ = table_info[table_id]
+                color = (0, 0, 255) if occupied else (0, 255, 0)
+
+                cv2.fillPoly(overlay, [table["draw"]], color)
+
+            frame = cv2.addWeighted(overlay, 0.18, frame, 0.82, 0)
+
+            for contour in staff_contours:
                 cv2.polylines(
                     frame,
                     [contour.astype(np.int32)],
                     True,
-                    (128, 128, 128),
+                    (255, 0, 255),
                     1
                 )
 
-        for table_id, table in tables.items():
+            if DEBUG_LABELS:
+                for contour in ignore_contours:
+                    cv2.polylines(
+                        frame,
+                        [contour.astype(np.int32)],
+                        True,
+                        (128, 128, 128),
+                        1
+                    )
 
-            occupied, people_count = table_info[table_id]
+            for table_id, table in tables.items():
 
-            color = (0, 0, 255) if occupied else (0, 255, 0)
-            status = "OCCUPIED" if occupied else "AVAILABLE"
+                occupied, people_count = table_info[table_id]
 
-            cv2.polylines(frame, [table["draw"]], True, color, 3)
+                color = (0, 0, 255) if occupied else (0, 255, 0)
+                status = "OCCUPIED" if occupied else "AVAILABLE"
 
-            center = np.mean(table["draw"], axis=0).astype(int)
+                cv2.polylines(frame, [table["draw"]], True, color, 3)
 
-            cv2.putText(
-                frame,
-                f"{table_id}: {status}",
-                (int(center[0]) - 80, int(center[1])),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
+                center = np.mean(table["draw"], axis=0).astype(int)
 
-            cv2.putText(
-                frame,
-                f"People: {people_count}",
-                (int(center[0]) - 80, int(center[1]) + 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
-
-        for (x1, y1, x2, y2), track_id, label, color in detections:
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            cv2.putText(
-                frame,
-                f"ID: {track_id}",
-                (x1, max(20, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2
-            )
-
-            if label:
                 cv2.putText(
                     frame,
-                    label,
-                    (x1, y2 + 20),
+                    f"{table_id}: {status}",
+                    (int(center[0]) - 80, int(center[1])),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
+                    0.6,
                     color,
                     2
                 )
 
-        total_tables = len(tables)
-        available_count = total_tables - occupied_count
+                cv2.putText(
+                    frame,
+                    f"People: {people_count}",
+                    (int(center[0]) - 80, int(center[1]) + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
+                )
 
-        cv2.rectangle(frame, (10, 10), (370, 110), (30, 30, 30), -1)
+            for (x1, y1, x2, y2), track_id, label, color in detections:
 
-        cv2.putText(
-            frame, f"Total Tables: {total_tables}", (25, 38),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2
-        )
-        cv2.putText(
-            frame, f"Occupied: {occupied_count}", (25, 68),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2
-        )
-        cv2.putText(
-            frame, f"Available: {available_count}", (25, 98),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2
-        )
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        cv2.imshow("Restaurant Table Occupancy", frame)
+                cv2.putText(
+                    frame,
+                    f"ID: {track_id}",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2
+                )
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+                if label:
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        color,
+                        2
+                    )
 
-    cap.release()
-    cv2.destroyAllWindows()
+            total_tables = len(tables)
+            available_count = total_tables - occupied_count
 
+            cv2.rectangle(frame, (10, 10), (370, 110), (30, 30, 30), -1)
+
+            cv2.putText(
+                frame, f"Total Tables: {total_tables}", (25, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2
+            )
+            cv2.putText(
+                frame, f"Occupied: {occupied_count}", (25, 68),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2
+            )
+            cv2.putText(
+                frame, f"Available: {available_count}", (25, 98),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2
+            )
+
+            video_writer.write(frame)
+
+            elapsed = time.perf_counter() - processing_started
+            processing_fps = frame_number / elapsed if elapsed > 0 else 0.0
+            if frame_number == 1 or frame_number % max(1, int(eff_fps)) == 0:
+                if total_frames > 0:
+                    source_frame = min(frame_number * max(1, DETECT_EVERY_N), total_frames)
+                    progress = 100.0 * source_frame / total_frames
+                    print(
+                        f"Progress: {progress:5.1f}% "
+                        f"({source_frame}/{total_frames} source frames), "
+                        f"processing: {processing_fps:.2f} FPS",
+                        flush=True
+                    )
+                else:
+                    print(
+                        f"Processed {frame_number} frames, "
+                        f"processing: {processing_fps:.2f} FPS",
+                        flush=True
+                    )
+    finally:
+        video_writer.release()
+        cap.release()
+
+    elapsed = time.perf_counter() - processing_started
+    processing_fps = frame_number / elapsed if elapsed > 0 else 0.0
+    print(f"Processed video saved: {output_path}")
+    print(
+        f"Processed {frame_number} frames in {elapsed:.1f}s "
+        f"({processing_fps:.2f} processing FPS)."
+    )
 
 def pick_points():
     """
