@@ -63,7 +63,7 @@ python -m pip install ultralytics opencv-python numpy torch lap
 Clone the repository and create an environment:
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/ahmaddii/TableVision
 cd Restaurent-Table-Detection
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
