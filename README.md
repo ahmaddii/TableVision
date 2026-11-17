@@ -20,7 +20,7 @@ No new hardware. No sensors. Just the cameras you already have.
 <br>
 
 [**Features**](#-features) ·
-[**How it works**](#-how-it-works) ·
+[**How it works**](#%EF%B8%8F-how-it-works) ·
 [**Quick start**](#-quick-start) ·
 [**Configuration**](#%EF%B8%8F-configuration) ·
 [**Roadmap**](#%EF%B8%8F-roadmap) ·
@@ -39,7 +39,7 @@ No new hardware. No sensors. Just the cameras you already have.
 Most restaurants already have CCTV. **TableVision** is a computer vision prototype that analyzes that footage to detect and track people, assign them to tables, and show which tables are **free**, **being checked**, or **taken**.
 
 > [!WARNING]
-> **Experimental prototype.** Occupancy and guest counts are estimates and may be inaccurate in some scenes. See [Limitations](#-limitations).
+> **Experimental prototype.** Occupancy and guest counts are estimates and may be inaccurate in some scenes. See [Limitations](#%EF%B8%8F-limitations).
 
 ---
 
